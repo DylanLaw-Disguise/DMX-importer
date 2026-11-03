@@ -11,7 +11,7 @@ Browse a fixture library, lay the rig out on a DMX universe map, and import it i
 3. Set **IP** and **Port** in the header (`127.0.0.1` and `81` for the local machine).
 4. Pick fixtures, address them on the map, and press **Import all to Designer**.
 
-Save the project in Designer to keep what has been imported.
+The project is saved automatically after each import.
 
 ## Patching
 
@@ -39,5 +39,8 @@ A fetched light can also be re-addressed by dragging its block on the map — on
 A 3D view of the rig read from the session. Click a fixture to select it and control intensity, colour (RGB or CCT), and pan and tilt from the console beside it. **FLASH** puts the selected fixture at full white to identify it.
 
 ## Timeline
+
+A project has one track per transport, so pick the one you are working on from the
+selector in the timeline toolbar.
 
 Record the console's current look as a keyframe at the playhead. Keyframes can be dragged along a layer, the timeline can be scrubbed, and the result plays back in the browser. Keyframes are written into Designer's timeline.

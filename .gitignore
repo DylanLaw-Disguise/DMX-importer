@@ -1,0 +1,8 @@
+# The OFL export the "Rescan Fixtures folder" button reads. 646 files / 12 MB,
+# and the index it produces is already baked into index.html, so it is kept out
+# of the repo. Point the button at any local OFL export instead.
+Fixtures/
+
+# Superseded by index.html
+creating fixtures and drivers.txt
+reference.png

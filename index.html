@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Disguise – DMX Patch</title>
+<meta name="disguise-plugin-window-size" content="1500,950">
+<meta name="disguise-plugin-window-min-size" content="900,600">
+<meta name="disguise-plugin-window-resizable" content="true">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -497,6 +500,7 @@
         <span style="flex:1"></span>
         <button class="ghost" id="tlOut">–</button>
         <button class="ghost" id="tlIn">+</button>
+        <select id="tlTrack" title="Which transport's track to read and write"></select>
         <button class="ghost" id="tlRefresh">Refresh</button>
       </div>
       <div id="tlStatus">Select a fixture, set a look, then record it.</div>
@@ -1874,7 +1878,8 @@ function buildPython(p) {
     var L = [];
     L.push('lamp = driver.lamp');
     L.push('if lamp is None:');
-    L.push('    return {"error": "the driver has no lamp to address"}');
+    L.push('    fail("the driver has no lamp to address")');
+    L.push('markDirty(lamp)');
     if (m.dimmer)   L.push('lamp.dimmer_channel = ' + m.dimmer);
     if (m.red)      L.push('lamp.red_channel = '    + m.red);
     if (m.green)    L.push('lamp.green_channel = '  + m.green);
@@ -1886,9 +1891,11 @@ function buildPython(p) {
     if (m.yellow)   L.push('lamp.yellow_channel = ' + m.yellow);
     if (m.zoom)     L.push('lamp.zoom_channel = '   + m.zoom);
     if (m.zoomFine) L.push('lamp.zoom_channel_fine = ' + m.zoomFine);
-    L.push('markDirty(lamp)');
     if (m.pan || m.tilt) {
       L.push('pt = driver.pan_tilt');
+      L.push('if pt is None:');
+      L.push('    fail("the driver has no pan/tilt to address")');
+      L.push('markDirty(pt)');
       if (m.pan)      L.push('pt.pan_channel = '      + m.pan);
       if (m.panFine)  L.push('pt.pan_fine_channel = ' + m.panFine);
       if (m.tilt)     L.push('pt.tilt_channel = '     + m.tilt);
@@ -1898,7 +1905,6 @@ function buildPython(p) {
         L.push('pt.tilt_min = ' + pr.tiltMin.toFixed(1));
         L.push('pt.tilt_max = ' + pr.tiltMax.toFixed(1));
       }
-      L.push('markDirty(pt)');
     }
     driverBlock =
       '# GenericLampDriver (explicit per-channel offsets)\n' +
@@ -1907,22 +1913,25 @@ function buildPython(p) {
       '# loadOrCreate returns None rather than upgrading the type, so clear any\n' +
       '# wrong-typed driver sitting at this path first.\n' +
       'for _d in resourceManager.allResources(DmxDriver):\n' +
-      '    if str(_d.path) == str(driver_path) and str(type(_d)).find("GenericLampDriver") < 0:\n' +
+      '    if str(_d.path) == str(driver_path) and not isinstance(_d, GenericLampDriver):\n' +
       '        _d.moveToTrash()\n' +
       'driver = resourceManager.loadOrCreate(driver_path, GenericLampDriver)\n' +
       'if driver is None:\n' +
-      '    return {"error": "could not make a GenericLampDriver at " + str(driver_path)}\n' +
+      '    fail("could not make a GenericLampDriver at " + str(driver_path))\n' +
+      'markDirty(driver)\n' +
       'driver.mode = ' + p.colorMode + '\n' +
       L.join('\n') + '\n' +
-      'markDirty(driver)\n' +
+      '# lamp and pan_tilt are unnamed: saving the driver is what persists them.\n' +
       'driver.saveOnDelete()';
   } else {
     driverBlock =
       '# DmxDriver (colour mixer)\n' +
       'driver_path = Path("objects/dmxdriver/{}.apx".format(driver_name))\n' +
       'driver = resourceManager.loadOrCreate(driver_path, DmxDriver)\n' +
-      'driver.mode = ' + p.colorMode + '\n' +
+      'if driver is None:\n' +
+      '    fail("could not make a DmxDriver at " + str(driver_path))\n' +
       'markDirty(driver)\n' +
+      'driver.mode = ' + p.colorMode + '\n' +
       'driver.saveOnDelete()';
   }
 
@@ -1935,6 +1944,13 @@ function buildPython(p) {
     '# 1. Fixture',
     'fixture_path = Path("objects/fixture/{}.apx".format(fixture_name))',
     'fixture = resourceManager.loadOrCreate(fixture_path, Fixture)',
+    'def fail(msg):',
+    '    raise RuntimeError(msg)',
+    'if fixture is None:',
+    '    return {"error": "could not make a Fixture at " + str(fixture_path)}',
+    '# From here on a failure must raise so the rollback undoes the part-built',
+    '# fixture, rather than leaving it half-configured.',
+    'markDirty(fixture)',
     'fixture.nChannels = ' + p.nChannels,
     'fixture.size_ = Vec(' + p.size[0] + ', ' + p.size[1] + ', ' + p.size[2] + ')',
     '',
@@ -1942,7 +1958,6 @@ function buildPython(p) {
     driverBlock,
     '',
     'fixture.driver = driver',
-    'markDirty(fixture)',
     'fixture.saveOnDelete()',
     '',
     '# 3. Assigner',
@@ -1977,7 +1992,8 @@ function buildPython(p) {
     'dmx_light.fixture    = fixture',
     'dmx_light.nAcross    = ' + p.units,
     'dmx_light.nDown      = 1',
-    '# Mark dirty so edits to an existing light are saved. Don\'t saveOnDelete it:',
+    '# A FixtureGroup is a NAMED resource (it has its own path), so per the',
+    '# resource guidelines it is saved like any other.',
     '# the stage owns it, and registering it twice duplicates the resource.',
     'markDirty(dmx_light)',
     '',
@@ -2133,13 +2149,12 @@ document.getElementById('importBtn').onclick = async function(){
   if (moves.length) parts.push(movedOk + ' re-addressed' + (movedFail ? ', ' + movedFail + ' failed' : ''));
   logLine((failed || movedFail) ? 'err' : 'ok', 'Done — ' + parts.join('; ') + '.');
   status.className = (failed || movedFail) ? 'err' : 'ok';
-  status.className = (failed || movedFail) ? 'err' : 'warn';
-  status.textContent = parts.join('; ') +
-    ' — now shown as in-scene. Save the project in Designer to keep it: ' +
-    'an unsaved Python change is lost if any later script errors.';
   logLine('info', '');
-  logLine('info', 'Save the project in Designer now. Until you do, these fixtures');
-  logLine('info', 'exist only in memory and any script error reverts them.');
+  logLine('info', 'Saving the project…');
+  var note = await d3SaveNote();
+  logLine(note.indexOf('NOT SAVED') >= 0 ? 'err' : 'ok', note.trim());
+  status.className = (failed || movedFail || note.indexOf('NOT SAVED') >= 0) ? 'err' : 'ok';
+  status.textContent = parts.join('; ') + ' — now shown as in-scene.' + note;
   renderAll();
 };
 
@@ -2189,7 +2204,7 @@ var SCENE_PY = [
   '            dv = f.driver',
   '            if dv is not None:',
   '                tn = str(type(dv)).replace("<class \'d3.", "").replace("\'>", "")',
-  '                isGld = tn.find("GenericLampDriver") >= 0',
+  '                isGld = isinstance(dv, GenericLampDriver)',
   '                dvp = str(dv.path)',
   '                drv = {"type": tn, "mode": None, "channels": {},',
   '                       "pt": {}, "commands": [], "extra": {},',
@@ -2412,11 +2427,13 @@ function buildDriverMapPython(p) {
   L.push('if fx is None:');
   L.push('    return {"error": "the light has no fixture"}');
   L.push('dv = fx.driver');
-  L.push('if dv is None or str(type(dv)).find("GenericLampDriver") < 0:');
+  L.push('if dv is None or not isinstance(dv, GenericLampDriver):');
   L.push('    return {"error": "this fixture has no Generic Lamp driver to edit"}');
   L.push('lamp = dv.lamp');
   L.push('if lamp is None:');
   L.push('    return {"error": "the driver has no lamp"}');
+  L.push('def fail(msg):');
+  L.push('    raise RuntimeError(msg)');
   L.push('markDirty(lamp)');
   Object.keys(DRV_FIELD).forEach(function(k){
     if (DRV_FIELD[k][0] !== 'lamp') return;
@@ -2427,7 +2444,7 @@ function buildDriverMapPython(p) {
   L.push('pt = dv.pan_tilt');
   L.push('if pt is None:');
   L.push(wantsPt
-    ? '    return {"error": "this driver has no pan/tilt to assign those channels to"}'
+    ? '    fail("this driver has no pan/tilt to assign those channels to")'
     : '    pass');
   L.push('else:');
   L.push('    markDirty(pt)');
@@ -2435,8 +2452,7 @@ function buildDriverMapPython(p) {
     if (DRV_FIELD[k][0] !== 'pt') return;
     L.push('    pt.' + DRV_FIELD[k][1] + ' = ' + (e[k] || 0));
   });
-  L.push('    pt.saveOnDelete()');
-  L.push('markDirty(dv)');
+  L.push('# lamp and pan_tilt are unnamed; the driver is their named parent.');
   L.push('dv.saveOnDelete()');
   L.push('return {"driver": str(dv.path)}');
   return L.join('\n');
@@ -2461,23 +2477,25 @@ function buildConvertDriverPython(p) {
   L.push('    return {"error": "the light has no fixture"}');
   L.push('newPath = Path(' + JSON.stringify('objects/dmxdriver/' + _slug_js(p) + '_gld.apx') + ')');
   L.push('for _d in resourceManager.allResources(DmxDriver):');
-  L.push('    if str(_d.path) == str(newPath) and str(type(_d)).find("GenericLampDriver") < 0:');
+  L.push('    if str(_d.path) == str(newPath) and not isinstance(_d, GenericLampDriver):');
   L.push('        _d.moveToTrash()');
   L.push('d = resourceManager.loadOrCreate(newPath, GenericLampDriver)');
   L.push('if d is None:');
   L.push('    return {"error": "could not make a GenericLampDriver at " + str(newPath)}');
+  L.push('def fail(msg):');
+  L.push('    raise RuntimeError(msg)');
   L.push('markDirty(d)');
   L.push('d.mode = ' + mode);
   L.push('lamp = d.lamp');
   L.push('if lamp is None:');
-  L.push('    return {"error": "the new driver has no lamp"}');
+  L.push('    fail("the new driver has no lamp")');
   L.push('markDirty(lamp)');
   seed.forEach(function(slot, i){
     L.push('lamp.' + DRV_FIELD[slot][1] + ' = ' + (i + 1));
   });
   L.push('d.saveOnDelete()');
-  L.push('fx.driver = d');
   L.push('markDirty(fx)');
+  L.push('fx.driver = d');
   L.push('fx.saveOnDelete()');
   L.push('return {"driver": str(d.path), "seeded": ' + seed.length + '}');
   return L.join('\n');
@@ -2498,9 +2516,10 @@ async function applyDriverMap(p) {
     var again = SEL;
     var m2 = document.getElementById('sMapMsg');
     if (m2) {
-      m2.className = 'note ok';
+      var note = await d3SaveNote();
+      m2.className = 'note ' + (note.indexOf('NOT SAVED') >= 0 ? 'err' : 'ok');
       m2.textContent = 'Channel map written' + (again ? ' to ' + again.name : '') +
-                       '. Save the project in Designer to keep it.';
+                       '.' + note;
     }
   } catch (err) {
     say('err', 'Failed: ' + err.message);
@@ -2516,10 +2535,11 @@ async function convertDriver(p) {
     await refetchKeepingSelection(p.name);
     var m2 = document.getElementById('sMapMsg');
     if (m2) {
-      m2.className = 'note ok';
+      var note = await d3SaveNote();
+      m2.className = 'note ' + (note.indexOf('NOT SAVED') >= 0 ? 'err' : 'ok');
       m2.textContent = 'Now on ' + (rv && rv.driver ? rv.driver : 'a Generic Lamp driver') +
                        ' with ' + ((rv && rv.seeded) || 0) + ' channel(s) seeded. ' +
-                       'The map below is editable. Save the project in Designer to keep it.';
+                       'The map below is editable.' + note;
     }
   } catch (err) {
     say('err', 'Failed: ' + err.message);
@@ -3265,10 +3285,10 @@ function buildRemovePython(p) {
   var n = resourceNames(p);
   return [
     '# Nothing here may raise: an exception reverts the whole project.',
-    'track = None',
-    'for r in resourceManager.allResources(Track):',
-    '    track = r',
-    '    break',
+    PY_LEAVES,
+    '',
+    pyTrack(),
+    'markDirty(track)',
     'light = None',
     'for x in state.stage.dmxLights:',
     '    if x is not None and str(x.path) == ' + JSON.stringify(p.lightPath) + ':',
@@ -3285,27 +3305,51 @@ function buildRemovePython(p) {
     '    if d is not None:',
     '        dvPath = str(d.path)',
     '',
-    '# is anything else still using that fixture?',
+    '# Is anything else still using that fixture? Count every FixtureGroup in',
+    '# the project, not only the ones currently on the stage.',
     'shared = 0',
-    'for x in state.stage.dmxLights:',
+    'for x in resourceManager.allResources(FixtureGroup):',
     '    if x is None or str(x.path) == str(light.path):',
+    '        continue',
+    '    if str(x.path).find("trash/") >= 0:',
     '        continue',
     '    xf = x.fixture',
     '    if xf is not None and str(xf.path) == fxPath:',
     '        shared = shared + 1',
     '',
+    '# A driver is referenced by Fixtures, not by lights, and one driver can',
+    '# serve many - the stock rgb.apx does. Count those separately.',
+    'dvShared = 0',
+    'for xf in resourceManager.allResources(Fixture):',
+    '    if xf is None or str(xf.path) == fxPath:',
+    '        continue',
+    '    if str(xf.path).find("trash/") >= 0:',
+    '        continue',
+    '    xd = xf.driver',
+    '    if xd is not None and str(xd.path) == dvPath:',
+    '        dvShared = dvShared + 1',
+    '',
+    '# Only ever trash a driver this tool made. Anything else - a stock driver,',
+    '# or one built by hand in Designer - is left alone whatever the count says.',
+    'ownsDriver = dvPath.endswith("_drv.apx") or dvPath.endswith("_gld.apx")',
+    '',
     'removed = []',
     '',
     '# layers this tool wrote for the fixture',
+    'grouped = []',
     'if track is not None:',
     '    for nm in [' + JSON.stringify(p.name + '_rgb') + ', ' + JSON.stringify(p.name + '_dmx') + ']:',
-    '        lay = None',
+    '        top = None',
     '        for x in track.layers:',
-    '            if x is not None and str(x.name) == nm:',
-    '                lay = x',
-    '        if lay is not None:',
-    '            track.removeLayer(lay)',
+    '            if x is not None and hasattr(x, "fields") and str(x.name) == nm:',
+    '                top = x',
+    '        if top is not None:',
+    '            track.removeLayer(top)',
     '            removed.append(nm)',
+    '        elif layerByName(track, nm) is not None:',
+    '            # inside a layer group; removing it from there is not something',
+    '            # this tool can do safely, so say so rather than guess.',
+    '            grouped.append(nm)',
     '',
     '# off the stage first, then trash the per-instance resources',
     'keep = [x for x in state.stage.dmxLights if x is not None and str(x.path) != ' +
@@ -3317,18 +3361,29 @@ function buildRemovePython(p) {
       JSON.stringify(n.assigner) + ' + ".apx"]',
     'for nm in ["mix", "cct", "tint", "intensity", "pan", "tilt"]:',
     '    paths.append("objects/dmxcommand/" + ' + JSON.stringify(p.name) + ' + "_" + nm + ".apx")',
+    'kept = []',
     'if shared == 0:',
     '    if fxPath:',
     '        paths.append(fxPath)',
-    '    if dvPath:',
-    '        paths.append(dvPath)',
+    'elif fxPath:',
+    '    kept.append(fxPath.split("/")[-1] + " (used by " + str(shared) + " more)")',
+    'if dvPath and dvShared == 0 and ownsDriver:',
+    '    paths.append(dvPath)',
+    'elif dvPath and dvShared > 0:',
+    '    kept.append(dvPath.split("/")[-1] + " (driver used by " + str(dvShared) + " fixture(s))")',
+    'elif dvPath and not ownsDriver:',
+    '    kept.append(dvPath.split("/")[-1] + " (not created by this tool)")',
     'for pth in paths:',
     '    r2 = resourceManager.load(Path(pth))',
     '    if r2 is not None:',
     '        r2.moveToTrash()',
     '        removed.append(pth.split("/")[-1])',
     '',
-    'return {"removed": removed, "sharedFixtureKept": shared}'
+    '# Layers are unnamed: the Track is their named parent.',
+    'if track is not None:',
+    '    track.saveOnDelete()',
+    'return {"removed": removed, "sharedFixtureKept": shared,',
+    '        "grouped": grouped, "kept": kept}'
   ].join('\n');
 }
 
@@ -3350,7 +3405,11 @@ async function removeFromDesigner(p) {
     st.className = 'ok';
     st.textContent = 'Removed ' + p.name + ' (' + (rv && rv.removed ? rv.removed.length : 0) +
       ' object(s) trashed' + (rv && rv.sharedFixtureKept ? '; fixture kept, still used by ' +
-      rv.sharedFixtureKept : '') + '). Save in Designer to make it permanent.';
+      rv.sharedFixtureKept : '') + ')' +
+      (rv && rv.kept && rv.kept.length ? '. Kept: ' + rv.kept.join(', ') : '') +
+      (rv && rv.grouped && rv.grouped.length
+        ? '. Still in a layer group, remove by hand: ' + rv.grouped.join(', ') : '') +
+      '.' + (await d3SaveNote());
   } catch (err) {
     st.className = 'err';
     st.textContent = 'Could not remove: ' + err.message;
@@ -3395,7 +3454,8 @@ function flashPlan(p, snap, absT) {
       var was = prior[f.name];
       if (was === undefined || was === null) ops.push([l.name, f.name, 'del', idx]);
       else if (Math.abs(was - f.keys[idx][1]) > 1e-6)
-        ops.push([l.name, f.name, 'set', was, f.keys[idx][0]]);
+        // keys[][0] is relative seconds; the script wants beats.
+        ops.push([l.name, f.name, 'set', was, secToBeat(f.keys[idx][0])]);
     });
   });
   return ops;
@@ -3412,18 +3472,12 @@ function buildUnflashPython(ops) {
     '        nm = nm()',
     '    return str(nm)',
     '',
-    'track = None',
-    'for r in resourceManager.allResources(Track):',
-    '    track = r',
-    '    break',
-    'if track is None:',
-    '    return {"error": "project has no track"}',
+    PY_LEAVES,
+    '',
+    pyTrack(),
     '',
     'def findLayer(nm):',
-    '    for x in track.layers:',
-    '        if x is not None and str(x.name) == nm:',
-    '            return x',
-    '    return None',
+    '    return layerByName(track, nm)',
     '',
     'def findField(lay, nm):',
     '    fs = lay.fields',
@@ -3454,6 +3508,8 @@ function buildUnflashPython(ops) {
     '        fld.disableSequencing = False',
     '        sq.setFloat(op[4], op[3])',
     '        restored = restored + 1',
+    '# Fields and sequences are unnamed: the Track is their named parent.',
+    'track.saveOnDelete()',
     'return {"removed": removed, "restored": restored}'
   ].join('\n');
 }
@@ -3497,7 +3553,8 @@ async function toggleFlash(p) {
       c.flashed = null;
       await tlFetch();
       say('ok', 'Flash cleared at ' + s.t.toFixed(1) + 's - ' + (rv.removed || 0) +
-                ' key(s) removed, ' + (rv.restored || 0) + ' put back.');
+                ' key(s) removed, ' + (rv.restored || 0) + ' put back.' +
+                (await d3SaveNote()));
     } else {
       var t = TL.t;
       var snap = flashCapture(p, t);
@@ -3513,7 +3570,8 @@ async function toggleFlash(p) {
       c.rgb = [255, 255, 255];
       c.intensity = 100;
       await tlFetch();
-      say('ok', 'Full white written at ' + t.toFixed(1) + 's. Press FLASH again to clear it.');
+      say('ok', 'Full white written at ' + t.toFixed(1) + 's. Press FLASH again to clear it.' +
+                (await d3SaveNote()));
     }
   } catch (err) {
     say('err', 'Flash failed: ' + err.message);
@@ -3817,7 +3875,36 @@ function kelvinToDmx(p, kelvin) {
 }
 
 // Shared Python helpers for every timeline write.
+// A track can hold GroupLayers (folders). A GroupLayer has no `.fields` at
+// all, so walking layers blindly raises - and a raise reverts the project.
+// Its own getLeafLayers() takes arguments we do not know, so do the walk here
+// with hasattr, which cannot raise.
+var PY_LEAVES = [
+  'def _leaves(container, acc):',
+  '    for lay in container.layers:',
+  '        if lay is None:',
+  '            continue',
+  '        if hasattr(lay, "layers"):',
+  '            _leaves(lay, acc)',
+  '        elif hasattr(lay, "fields"):',
+  '            acc.append(lay)',
+  '    return acc',
+  '',
+  'def trackLayers(track):',
+  '    return _leaves(track, [])',
+  '',
+  'def layerByName(track, nm):',
+  '    for x in trackLayers(track):',
+  '        if str(x.name) == nm:',
+  '            return x',
+  '    return None'
+].join('\n');
+
 var PY_HELPERS = [
+  '# Fields this tool expected but could not find. A silent miss here means a',
+  '# layer looks written when nothing was set on it.',
+  'missingFields = []',
+  '',
   'def fieldByName(layer, wantName):',
   '    fs = layer.fields',
   '    for i in range(len(fs)):',
@@ -3832,6 +3919,7 @@ var PY_HELPERS = [
   'def setRes(layer, fieldName, res, tKey):',
   '    f = fieldByName(layer, fieldName)',
   '    if f is None:',
+  '        missingFields.append(str(layer.name) + "." + fieldName)',
   '        return False',
   '    markDirty(f)',
   '    f.sequence.setResource(tKey, res)',
@@ -3840,6 +3928,7 @@ var PY_HELPERS = [
   'def setNum(layer, fieldName, val, tKey):',
   '    f = fieldByName(layer, fieldName)',
   '    if f is None:',
+  '        missingFields.append(str(layer.name) + "." + fieldName)',
   '        return False',
   '    markDirty(f)',
   '    f.disableSequencing = False',
@@ -3862,11 +3951,10 @@ var PY_HELPERS = [
   '        markDirty(f)',
   '        f.disableSequencing = False',
   '',
+  PY_LEAVES,
+  '',
   'def findLayer(track, nm):',
-  '    for x in track.layers:',
-  '        if x is not None and str(x.name) == nm:',
-  '            return x',
-  '    return None'
+  '    return layerByName(track, nm)'
 ];
 
 // Build the whole timeline state for one fixture: an RGB colour layer mapped at
@@ -3917,12 +4005,13 @@ function buildTimelinePython(p, c, atT) {
   L.push('        dp = r');
   L.push('if dp is None:');
   L.push('    return {"error": "no DirectProjection for " + want}');
-  L.push('track = None');
-  L.push('for r in resourceManager.allResources(Track):');
-  L.push('    track = r');
-  L.push('    break');
-  L.push('if track is None:');
-  L.push('    return {"error": "project has no track"}');
+  L.push(pyTrack());
+  L.push('# Once layers start being created, a failure must raise so Designer');
+  L.push('# rolls the whole execution back instead of leaving half a rig.');
+  L.push('def fail(msg):');
+  L.push('    raise RuntimeError(msg)');
+  L.push('# addNewLayer changes the track\'s own layer list, so mark it first.');
+  L.push('markDirty(track)');
   L.push('made = []');
   L.push('');
 
@@ -3932,19 +4021,19 @@ function buildTimelinePython(p, c, atT) {
     L.push('rgbName = ' + JSON.stringify(base + '_rgb'));
     L.push('lay = findLayer(track, rgbName)');
     L.push('if lay is None:');
-    L.push('    lay = track.addNewLayer(RGBColourModule, ' + tStart.toFixed(1) + ', ' + tEnd.toFixed(1) + ', rgbName)');
+    L.push('    lay = track.addNewLayer(RGBColourModule, ' + pyBeat(tStart) + ', ' + pyBeat(tEnd) + ', rgbName)');
     L.push('    made.append("created " + rgbName)');
     L.push('else:');
     L.push('    made.append("updated " + rgbName)');
     L.push('if lay is None:');
-    L.push('    return {"error": "could not create the colour layer"}');
-    L.push('if ' + absT.toFixed(3) + ' < lay.tStart:');
+    L.push('    fail("could not create the colour layer")');
+    L.push('if ' + pyBeat(absT) + ' < lay.tStart:');
     L.push('    markDirty(lay)');
-    L.push('    lay.setExtents(' + absT.toFixed(3) + ', lay.tEnd)');
-    L.push('if ' + absT.toFixed(3) + ' > lay.tEnd:');
+    L.push('    lay.setExtents(' + pyBeat(absT) + ', lay.tEnd)');
+    L.push('if ' + pyBeat(absT) + ' > lay.tEnd:');
     L.push('    markDirty(lay)');
-    L.push('    lay.setExtents(lay.tStart, ' + (absT + 5).toFixed(3) + ')');
-    L.push('kt = ' + absT.toFixed(3) + ' - lay.tStart');
+    L.push('    lay.setExtents(lay.tStart, ' + pyBeat(absT + 5) + ')');
+    L.push('kt = ' + pyBeat(absT) + ' - lay.tStart');
     L.push('if kt < 0:');
     L.push('    kt = 0.0');
     L.push('setRes(lay, "mapping", dp, kt)');
@@ -3961,19 +4050,19 @@ function buildTimelinePython(p, c, atT) {
     L.push('dmxName = ' + JSON.stringify(base + '_dmx'));
     L.push('dlay = findLayer(track, dmxName)');
     L.push('if dlay is None:');
-    L.push('    dlay = track.addNewLayer(DmxControlModule, ' + tStart.toFixed(1) + ', ' + tEnd.toFixed(1) + ', dmxName)');
+    L.push('    dlay = track.addNewLayer(DmxControlModule, ' + pyBeat(tStart) + ', ' + pyBeat(tEnd) + ', dmxName)');
     L.push('    made.append("created " + dmxName)');
     L.push('else:');
     L.push('    made.append("updated " + dmxName)');
     L.push('if dlay is None:');
-    L.push('    return {"error": "could not create the DMX control layer"}');
-    L.push('if ' + absT.toFixed(3) + ' < dlay.tStart:');
+    L.push('    fail("could not create the DMX control layer")');
+    L.push('if ' + pyBeat(absT) + ' < dlay.tStart:');
     L.push('    markDirty(dlay)');
-    L.push('    dlay.setExtents(' + absT.toFixed(3) + ', dlay.tEnd)');
-    L.push('if ' + absT.toFixed(3) + ' > dlay.tEnd:');
+    L.push('    dlay.setExtents(' + pyBeat(absT) + ', dlay.tEnd)');
+    L.push('if ' + pyBeat(absT) + ' > dlay.tEnd:');
     L.push('    markDirty(dlay)');
-    L.push('    dlay.setExtents(dlay.tStart, ' + (absT + 5).toFixed(3) + ')');
-    L.push('kt = ' + absT.toFixed(3) + ' - dlay.tStart');
+    L.push('    dlay.setExtents(dlay.tStart, ' + pyBeat(absT + 5) + ')');
+    L.push('kt = ' + pyBeat(absT) + ' - dlay.tStart');
     L.push('if kt < 0:');
     L.push('    kt = 0.0');
     L.push('setRes(dlay, "mapping", dp, kt)');
@@ -3999,6 +4088,11 @@ function buildTimelinePython(p, c, atT) {
     L.push('');
   }
 
+  L.push('# Layers, fields and sequences are unnamed: the Track is their named');
+  L.push('# parent, so none of the above persists without this.');
+  L.push('track.saveOnDelete()');
+  L.push('if len(missingFields) > 0:');
+  L.push('    fail("these fields are not on the layer: " + ", ".join(missingFields))');
   L.push('return {"made": made, "mapping": str(dp.path)}');
   return L.join('\n');
 }
@@ -4017,9 +4111,9 @@ async function writeTimeline(p) {
   out.textContent = 'Writing…';
   try {
     var rv = await d3Exec(buildTimelinePython(p, c, 0));
-    out.className = 'note ok';
-    out.textContent = (rv && rv.made ? rv.made.join(', ') : 'written') +
-      '. Save the project in Designer to keep it.';
+    var note = await d3SaveNote();
+    out.className = 'note ' + (note.indexOf('NOT SAVED') >= 0 ? 'err' : 'ok');
+    out.textContent = (rv && rv.made ? rv.made.join(', ') : 'written') + '.' + note;
   } catch (err) {
     out.className = 'note err';
     out.textContent = 'Failed: ' + err.message;
@@ -4036,27 +4130,84 @@ async function writeTimeline(p) {
    ════════════════════════════════════════════════════════════════════ */
 
 var TL = { track: 60, layers: [], pps: 4, t: 0, drag: null,
-           playing: false, raf: null, playFrom: 0, playClock: 0 };
+           playing: false, raf: null, playFrom: 0, playClock: 0,
+           // A project has one Track per transport. trackPath is the one this
+           // tool reads and writes; transports is what the selector lists.
+           trackPath: '', transports: [],
+           // Designer's track API is in beats. Everything in this UI is in
+           // seconds, so bpm is the conversion factor between them.
+           bpm: 60 };
+
+// Track.bpmAt() exists, so tempo can change along a track; this assumes it
+// does not. At the default 60 bpm both functions are the identity.
+function secToBeat(sec) { return sec * (TL.bpm || 60) / 60; }
+function beatToSec(b)   { return b * 60 / (TL.bpm || 60); }
+
+// A beat value ready to paste into generated Python.
+function pyBeat(sec) { return secToBeat(sec).toFixed(4); }
 var TL_GUT = 150;
 // TL.kdrag holds an in-progress keyframe drag   // width of the fixture-name column; ruler and lanes share it
 
-var TL_READ_PY = [
+// Resolve the working track inside generated Python. Never "the first one".
+function pyTrack() {
+  if (!TL.trackPath) {
+    // The track the user is looking at, not whichever one enumerates first.
+    return [
+      'track = guisystem.track',
+      'if track is None:',
+      '    for r in resourceManager.allResources(Track):',
+      '        track = r',
+      '        break',
+      'if track is None:',
+      '    return {"error": "project has no track"}'
+    ].join('\n');
+  }
+  return [
+    'track = None',
+    'for r in resourceManager.allResources(Track):',
+    '    if str(r.path) == ' + JSON.stringify(TL.trackPath) + ':',
+    '        track = r',
+    'if track is None:',
+    '    return {"error": "track " + ' + JSON.stringify(TL.trackPath) +
+      ' + " is not in this project - press Refresh"}'
+  ].join('\n');
+}
+
+function tlReadPy() {
+  return [
   'def fname(f):',
   '    nm = f.name',
   '    if str(type(nm)).find("method") >= 0:',
   '        nm = nm()',
   '    return str(nm)',
   '',
-  'track = None',
-  'for r in resourceManager.allResources(Track):',
-  '    track = r',
-  '    break',
-  'if track is None:',
-  '    return {"error": "project has no track"}',
-  'out = []',
-  'for lay in track.layers:',
-  '    if lay is None:',
+  PY_LEAVES,
+  '',
+  '# Every transport has its own track; report them all so the user can pick.',
+  'tms = []',
+  'for tm in resourceManager.allResources(TransportManager):',
+  '    tr = tm.track',
+  '    if tr is None:',
   '        continue',
+  '    nl = len(trackLayers(tr))',
+  '    tms.append({"name": str(tm.description), "track": str(tr.path),',
+  '                "trackName": str(tr.description), "length": tr.lengthInSec,',
+  '                "nLayers": nl, "engaged": tm.engaged})',
+  '# Tracks with no transport pointing at them are still selectable.',
+  'seen = []',
+  'for t in tms:',
+  '    seen.append(t["track"])',
+  'for tr in resourceManager.allResources(Track):',
+  '    if str(tr.path) in seen:',
+  '        continue',
+  '    nl = len(trackLayers(tr))',
+  '    tms.append({"name": "", "track": str(tr.path),',
+  '                "trackName": str(tr.description), "length": tr.lengthInSec,',
+  '                "nLayers": nl, "engaged": False})',
+  '',
+  pyTrack(),
+  'out = []',
+  'for lay in trackLayers(track):',
   '    flds = []',
   '    fs = lay.fields',
   '    for i in range(len(fs)):',
@@ -4070,11 +4221,17 @@ var TL_READ_PY = [
   '                k = sq.keys[j]',
   '                ks.append([k.localT, k.v])',
   '        flds.append({"name": fname(f), "keys": ks})',
+  '    mt = ""',
+  '    if hasattr(lay, "moduleType"):',
+  '        mt = str(lay.moduleType).replace("<class \'d3.", "").replace("\'>", "")',
   '    out.append({"name": str(lay.name),',
-  '                "module": str(lay.moduleType).replace("<class \'d3.", "").replace("\'>", ""),',
+  '                "module": mt,',
   '                "tStart": lay.tStart, "tEnd": lay.tEnd, "fields": flds})',
-  'return {"length": track.lengthInSec, "layers": out}'
-].join('\n');
+  'return {"length": track.lengthInSec, "layers": out,',
+  '        "bpm": track.bpm, "lengthInBeats": track.lengthInBeats,',
+  '        "transports": tms, "track": str(track.path)}'
+  ].join('\n');
+}
 
 // Every call into Designer goes through here, so a failure is diagnosed once
 // instead of surfacing as whatever the fetch happened to throw. The three
@@ -4161,6 +4318,33 @@ async function tlRun(script) {
   return d3Exec(script);
 }
 
+// Write the project to disk. Everything lives in the one .d3 file, so this is
+// the save - the same thing Ctrl+S does in Designer. Call it after an
+// operation completes rather than after every micro-edit; it rewrites the
+// whole project and takes a moment on a large one.
+async function d3SaveProject() {
+  var rv = await d3Exec([
+    '# Nothing here may raise: an exception reverts the whole project.',
+    'if not resourceManager.isSaveAllAllowed:',
+    '    return {"saved": False, "why": "Designer will not allow a save right now"}',
+    'code = resourceManager.saveAll()',
+    'return {"saved": code == 0, "code": code, "project": str(state.projectName)}'
+  ].join('\n'));
+  return rv || { saved: false };
+}
+
+// Saves, and turns the outcome into something to append to a status line.
+async function d3SaveNote() {
+  try {
+    var rv = await d3SaveProject();
+    if (rv.saved) return ' Project saved.';
+    return ' NOT SAVED - ' + (rv.why || ('saveAll returned ' + rv.code)) +
+           '; save in Designer.';
+  } catch (err) {
+    return ' NOT SAVED - ' + err.message + '; save in Designer.';
+  }
+}
+
 function tlStatus(cls, msg) {
   var el = document.getElementById('tlStatus');
   if (!el) return;
@@ -4170,14 +4354,88 @@ function tlStatus(cls, msg) {
 
 async function tlFetch() {
   try {
-    var rv = await tlRun(TL_READ_PY);
+    var rv = await tlRun(tlReadPy());
+    TL.transports = rv.transports || [];
+    TL.bpm = rv.bpm || 60;
     TL.track = rv.length || 60;
-    TL.layers = rv.layers || [];
+    TL.trackPath = rv.track || TL.trackPath;
+
+    // Designer hands back beats; the rest of this file is in seconds.
+    TL.layers = (rv.layers || []).map(function(l){
+      l.tStart = beatToSec(l.tStart);
+      l.tEnd   = beatToSec(l.tEnd);
+      l.fields = (l.fields || []).map(function(f){
+        f.keys = (f.keys || []).map(function(k){ return [beatToSec(k[0]), k[1]]; });
+        return f;
+      });
+      return l;
+    });
+
+    // First time through, land on the track that actually holds this tool's
+    // layers rather than whichever one came back first.
+    if (!TL.picked && TL.transports.length > 1) {
+      var want = tlGuessTrack();
+      TL.picked = true;
+      if (want && want !== TL.trackPath) {
+        TL.trackPath = want;
+        return tlFetch();
+      }
+    }
+    TL.picked = true;
+
+    tlRenderTracks();
     tlRender();
-    tlStatus('ok', TL.layers.length + ' layer(s) · track ' + TL.track.toFixed(0) + 's');
+    var tm = TL.transports.filter(function(t){ return t.track === TL.trackPath; })[0];
+    tlStatus('ok', TL.layers.length + ' layer(s) on ' +
+             (tm ? (tm.name ? tm.name + ' / ' : '') + (tm.trackName || tm.track) : TL.trackPath) +
+             ' · ' + TL.track.toFixed(0) + 's' +
+             (TL.transports.length > 1 ? ' · ' + TL.transports.length + ' transports' : ''));
   } catch (err) {
     tlStatus('err', 'Could not read the timeline: ' + err.message);
   }
+}
+
+// Which track to show by default: the one already carrying layers named after
+// a patched fixture. Falls back to the transport called "default", then to the
+// busiest track.
+function tlGuessTrack() {
+  var names = PLACED.filter(function(p){ return p.existing && p.name; })
+                    .map(function(p){ return String(p.name).toLowerCase(); });
+  var hit = null;
+  if (names.length) {
+    TL.layers.forEach(function(l){
+      var n = String(l.name).toLowerCase();
+      names.forEach(function(nm){
+        if (n === nm + '_rgb' || n === nm + '_dmx') hit = TL.trackPath;
+      });
+    });
+    if (hit) return hit;
+  }
+  var byName = TL.transports.filter(function(t){
+    return String(t.name).toLowerCase() === 'default'; })[0];
+  if (byName) return byName.track;
+  var best = null;
+  TL.transports.forEach(function(t){
+    if (!best || t.nLayers > best.nLayers) best = t;
+  });
+  return best ? best.track : '';
+}
+
+function tlRenderTracks() {
+  var sel = document.getElementById('tlTrack');
+  if (!sel) return;
+  if (TL.transports.length < 2) { sel.style.display = 'none'; return; }
+  sel.style.display = '';
+  sel.innerHTML = TL.transports.map(function(t){
+    var label = (t.name ? t.name : '(no transport)') + ' — ' +
+                (t.trackName || t.track) + '  (' + t.nLayers + ')';
+    return '<option value="' + _esc(t.track) + '"' +
+           (t.track === TL.trackPath ? ' selected' : '') + '>' + _esc(label) + '</option>';
+  }).join('');
+  sel.onchange = function(){
+    TL.trackPath = this.value;
+    tlFetch();
+  };
 }
 
 function tlX(t) { return t * TL.pps; }
@@ -4361,27 +4619,21 @@ function tlMoveStatePy(p, oldAbs, newAbs) {
     '        nm = nm()',
     '    return str(nm)',
     '',
-    'track = None',
-    'for r in resourceManager.allResources(Track):',
-    '    track = r',
-    '    break',
-    'if track is None:',
-    '    return {"error": "project has no track"}',
+    PY_LEAVES,
+    '',
+    pyTrack(),
     'moved = 0',
     'for nm in [' + JSON.stringify(base + '_rgb') + ', ' + JSON.stringify(base + '_dmx') + ']:',
-    '    lay = None',
-    '    for x in track.layers:',
-    '        if x is not None and str(x.name) == nm:',
-    '            lay = x',
+    '    lay = layerByName(track, nm)',
     '    if lay is None:',
     '        continue',
-    '    oldL = ' + oldAbs.toFixed(3) + ' - lay.tStart',
-    '    newL = ' + newAbs.toFixed(3) + ' - lay.tStart',
+    '    oldL = ' + pyBeat(oldAbs) + ' - lay.tStart',
+    '    newL = ' + pyBeat(newAbs) + ' - lay.tStart',
     '    if newL < 0:',
     '        newL = 0.0',
-    '    if ' + newAbs.toFixed(3) + ' > lay.tEnd:',
+    '    if ' + pyBeat(newAbs) + ' > lay.tEnd:',
     '        markDirty(lay)',
-    '        lay.setExtents(lay.tStart, ' + (newAbs + 5).toFixed(3) + ')',
+    '        lay.setExtents(lay.tStart, ' + pyBeat(newAbs + 5) + ')',
     '    fs = lay.fields',
     '    for i in range(len(fs)):',
     '        f = fs[i]',
@@ -4402,6 +4654,8 @@ function tlMoveStatePy(p, oldAbs, newAbs) {
     '            sq.remove(idx, 1)',
     '            sq.setFloat(newL, val)',
     '            moved = moved + 1',
+    '# Fields and sequences are unnamed: the Track is their named parent.',
+    'track.saveOnDelete()',
     'return {"moved": moved}'
   ].join('\n');
 }
@@ -4460,16 +4714,10 @@ function tlMovePy(l, s, e) {
   }).join(',\n');
 
   return [
-    'track = None',
-    'for r in resourceManager.allResources(Track):',
-    '    track = r',
-    '    break',
-    'if track is None:',
-    '    return {"error": "project has no track"}',
-    'lay = None',
-    'for x in track.layers:',
-    '    if x is not None and str(x.name) == ' + JSON.stringify(l.name) + ':',
-    '        lay = x',
+    PY_LEAVES,
+    '',
+    pyTrack(),
+    'lay = layerByName(track, ' + JSON.stringify(l.name) + ')',
     'if lay is None:',
     '    return {"error": "layer not found"}',
     '',
@@ -4483,7 +4731,7 @@ function tlMovePy(l, s, e) {
     keep,
     ']',
     'markDirty(lay)',
-    'lay.setExtents(' + s.toFixed(3) + ', ' + e.toFixed(3) + ')',
+    'lay.setExtents(' + pyBeat(s) + ', ' + pyBeat(e) + ')',
     '',
     '# restore each field to the offsets it had before the move',
     'fs = lay.fields',
@@ -4504,6 +4752,8 @@ function tlMovePy(l, s, e) {
     '        sq.remove(0, n)',
     '    for k in pair[1]:',
     '        sq.setFloat(k[0], k[1])',
+    '# The layer is unnamed: the Track is its named parent.',
+    'track.saveOnDelete()',
     'return {"tStart": lay.tStart, "tEnd": lay.tEnd}'
   ].join('\n');
 }
@@ -4519,9 +4769,11 @@ async function tlRecord() {
   try {
     tlStatus('', 'Recording…');
     var rv = await tlRun(buildTimelinePython(p, c, TL.t));
+    var note = await d3SaveNote();
     await tlFetch();
-    tlStatus('ok', 'Recorded ' + p.name + ' at ' + TL.t.toFixed(1) + 's · ' +
-             (rv && rv.made ? rv.made.join(', ') : ''));
+    tlStatus(note.indexOf('NOT SAVED') >= 0 ? 'err' : 'ok',
+             'Recorded ' + p.name + ' at ' + TL.t.toFixed(1) + 's · ' +
+             (rv && rv.made ? rv.made.join(', ') : '') + note);
   } catch (err) {
     tlStatus('err', 'Record failed: ' + err.message);
   }
@@ -4556,14 +4808,10 @@ async function tlClearAt() {
 
 function tlDelKeyPy(name, field, idx) {
   return [
-    'track = None',
-    'for r in resourceManager.allResources(Track):',
-    '    track = r',
-    '    break',
-    'lay = None',
-    'for x in track.layers:',
-    '    if x is not None and str(x.name) == ' + JSON.stringify(name) + ':',
-    '        lay = x',
+    PY_LEAVES,
+    '',
+    pyTrack(),
+    'lay = layerByName(track, ' + JSON.stringify(name) + ')',
     'if lay is None:',
     '    return {"error": "layer not found"}',
     'def fname(f):',
@@ -4583,6 +4831,8 @@ function tlDelKeyPy(name, field, idx) {
     '    return {"error": "keyframe gone"}',
     'markDirty(fld)',
     'sq.remove(' + idx + ', 1)',
+    '# The sequence is unnamed: the Track is its named parent.',
+    'track.saveOnDelete()',
     'return {"nKeys": sq.nKeys()}'
   ].join('\n');
 }
