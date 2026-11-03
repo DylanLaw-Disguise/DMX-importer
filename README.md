@@ -1,6 +1,6 @@
 <div align="center">
 
-# OFL Importer
+# DMX Importer
 
 **Patch, visualise and program DMX lighting fixtures in disguise Designer — from a single HTML file.**
 
