@@ -1,4 +1,4 @@
-# OFL Importer
+# DMX Importer
 
 A single HTML file for importing DMX lighting fixtures into disguise Designer.
 
